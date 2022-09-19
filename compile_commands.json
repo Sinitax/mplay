@@ -1,0 +1,18 @@
+[
+    {
+        "arguments": [
+            "cc",
+            "-c",
+            "-g",
+            "-I",
+            "src",
+            "-I",
+            "lib/minimp3/",
+            "-o",
+            "build/mplay",
+            "src/main.c"
+        ],
+        "directory": "/snxdata/lib/dev/mplay",
+        "file": "src/main.c"
+    }
+]
