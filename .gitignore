@@ -1,2 +1,3 @@
 .cache
-build/mplay
+mplay
+compile_commands.json

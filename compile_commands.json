@@ -1,18 +1,19 @@
 [
-    {
-        "arguments": [
-            "cc",
-            "-c",
-            "-g",
-            "-I",
-            "src",
-            "-I",
-            "lib/minimp3/",
-            "-o",
-            "build/mplay",
-            "src/main.c"
-        ],
-        "directory": "/snxdata/lib/dev/mplay",
-        "file": "src/main.c"
-    }
+  {
+    "arguments": [
+      "/usr/bin/cc",
+      "-c",
+      "-g",
+      "-I",
+      "src",
+      "-I",
+      "lib/minimp3/",
+      "-o",
+      "build/mplay",
+      "src/mplay.c"
+    ],
+    "directory": "/snx/dev/mplay",
+    "file": "/snx/dev/mplay/src/mplay.c",
+    "output": "/snx/dev/mplay/build/mplay"
+  }
 ]

@@ -1,19 +1,18 @@
 CFLAGS = -g -I src -I lib/minimp3/
-LDLIBS = 
+LDLIBS = -lpulse -lpulse-simple
 
-.PHONY: all clean
-
-all: build/mplay
+all: mplay
 
 clean:
-	rm -rf build
+	rm -f mplay
 
-build:
-	mkdir build
-
-build/%.o: src/%.c src/%.h | build
-	$(CC) -o $@ -c $< $(CFLAGS) $(LDLIBS)
-
-build/mplay: src/main.c | build
+mplay: src/mplay.c
 	$(CC) -o $@ $^ $(CFLAGS) $(LDLIBS)
 
+install:
+	install -m755 -t mplay "$(DESTDIR)$(PREFIX)$(BINDIR)"
+
+uninstall:
+	rm -f "$(DESTDIR)$(PREFIX)$(BINDIR)/mplay"
+
+.PHONY: all clean install uninstall
