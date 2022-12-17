@@ -1,3 +1,4 @@
+#include <pulse/introspect.h>
 #include <pulse/volume.h>
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
@@ -16,6 +17,15 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+enum {
+	KEY_NONE = 0,
+	KEY_BRK = 3,
+	KEY_LEFT = 0x100,
+	KEY_RIGHT,
+	KEY_UP,
+	KEY_DOWN,
+};
 
 #define ERR(...) err(1, __VA_ARGS__)
 #define ERRX(...) errx(1, __VA_ARGS__)
@@ -80,6 +90,9 @@ map_file(const char *path, size_t *len)
 	if (fstat(fd, &attr))
 		ERR("fstat %s", path);
 
+	if ((attr.st_mode & S_IFMT) == S_IFDIR)
+		ERRX("not a file: %s", path);
+
 	buf = mmap(NULL, attr.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
 	if (!buf) ERR("mmap %s", path);
 
@@ -102,6 +115,8 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 	while (remaining > 0 && mp3d.left > 0) {
 		cnt = mp3dec_decode_frame(&mp3d.dec,
 			mp3d.pos, mp3d.left, samples, &info);
+		if (mp3d.pos == audiofile.data && !cnt)
+			ERRX("Invalid mp3 input file");
 		if (!cnt && !info.frame_bytes) break;
 
 		mp3d.pos += info.frame_bytes;
@@ -113,6 +128,9 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 			NULL, 0, PA_SEEK_RELATIVE);
 		remaining -= info.frame_bytes;
 	}
+
+	if (!mp3d.left)
+		pa_mainloop_quit(pa_mloop, 0);
 }
 
 void
@@ -125,10 +143,10 @@ pa_stream_state_callback(pa_stream *stream, void *data)
 	case PA_STREAM_READY:
 		pa_stream_cork(stream, 0, NULL, NULL);
 		break;
-	case PA_STREAM_UNCONNECTED:
-		printf("DISCONECTED\n");
+	case PA_STREAM_TERMINATED:
 		pa_mainloop_quit(pa_mloop, 0);
 		break;
+	case PA_STREAM_UNCONNECTED:
 	case PA_STREAM_CREATING:
 	default:
 		break;
@@ -163,8 +181,11 @@ pa_state_callback(pa_context *pa_ctx, void *data)
 
 		ret = pa_stream_connect_playback(pa_strm,
 			NULL, &pa_buf, pa_stream_flags, NULL, NULL);
-		if (ret) PA_ERRX("pa_stream_connect_playback");
+		if (ret) PA_ERRX("pa_stream_connect_playback failed");
 
+		break;
+	case PA_CONTEXT_TERMINATED:
+		pa_mainloop_quit(pa_mloop, 0);
 		break;
 	case PA_CONTEXT_CONNECTING:
 	case PA_CONTEXT_UNCONNECTED:
@@ -191,12 +212,81 @@ pa_worker(void *arg)
 	return NULL;
 }
 
+int
+getkey_esc(void)
+{
+	char c;
+
+	c = getchar();
+	switch (c) {
+	case 'A':
+		return KEY_UP;
+	case 'B':
+		return KEY_DOWN;
+	case 'C':
+		return KEY_DOWN;
+	case 'D':
+		return KEY_DOWN;
+	default:
+		return KEY_NONE;
+	}
+}
+
+void
+cmd_inc_volume(void)
+{
+	pa_context_get_sink_input_info(pa_ctx,
+		pa_stream_get_index(pa_strm),
+		pa_sink_input_info_callback, NULL);
+	pa_cvolume_inc(&pa_strm_info.volume, 65536 / 20);
+	if (pa_cvolume_avg(&pa_strm_info.volume) > 2 * PA_VOLUME_NORM)
+		pa_cvolume_set(&pa_strm_info.volume, 2, 2 * PA_VOLUME_NORM);
+	pa_context_set_sink_input_volume(pa_ctx,
+		pa_stream_get_index(pa_strm),
+		&pa_strm_info.volume, NULL, NULL);
+	printf("VOLUME: %02.f\n",
+		pa_cvolume_avg(&pa_strm_info.volume)
+		* 100.f / PA_VOLUME_NORM);
+}
+
+void
+cmd_dec_volume(void)
+{
+	pa_context_get_sink_input_info(pa_ctx,
+		pa_stream_get_index(pa_strm),
+		pa_sink_input_info_callback, NULL);
+	pa_cvolume_dec(&pa_strm_info.volume, 65536 / 20);
+	pa_context_set_sink_input_volume(pa_ctx,
+		pa_stream_get_index(pa_strm),
+		&pa_strm_info.volume, NULL, NULL);
+	printf("VOLUME: %02.f\n",
+		pa_cvolume_avg(&pa_strm_info.volume)
+		* 100.f / PA_VOLUME_NORM);
+}
+
+int
+getkey(void)
+{
+	char c;
+
+	c = getchar();
+	if (c == 0x1b) {
+		c = getchar();
+		if (c == '[') {
+			return getkey_esc();
+		} else {
+			return KEY_NONE;
+		}
+	} else {
+		return c;
+	}
+}
+
 void *
 input_worker(void *arg)
 {
-	pa_cvolume vol;
 	struct termios old, new;
-	char c;
+	int key;
 
 	if (tcgetattr(0, &old))
 		ERR("tcgetattr");
@@ -205,27 +295,23 @@ input_worker(void *arg)
 	new.c_iflag |= BRKINT;
 	new.c_iflag &= ~IGNBRK;
 	new.c_lflag &= ~ICANON;
+	new.c_lflag &= ~ECHO;
 
 	if (tcsetattr(0, TCSANOW, &new))
 		ERR("tcsetattr");
 
-	while ((c = getchar())) {
-		if (c == '+') {
-			pa_context_get_sink_input_info(pa_ctx,
-				pa_stream_get_index(pa_strm),
-				pa_sink_input_info_callback, NULL);
-			pa_cvolume_inc(&pa_strm_info.volume, 1);
-			pa_context_set_sink_input_volume(pa_ctx,
-				pa_stream_get_index(pa_strm),
-				&pa_strm_info.volume, NULL, NULL);
-		} else if (c == '-') {
-			pa_context_get_sink_input_info(pa_ctx,
-				pa_stream_get_index(pa_strm),
-				pa_sink_input_info_callback, NULL);
-			pa_cvolume_dec(&pa_strm_info.volume, 1);
-			pa_context_set_sink_input_volume(pa_ctx,
-				pa_stream_get_index(pa_strm),
-				&pa_strm_info.volume, NULL, NULL);
+	while (true) {
+		while (!(key = getkey()));
+		if (key == '+' || key == KEY_UP) {
+			cmd_inc_volume();
+		} else if (key == '-' || key == KEY_DOWN) {
+			cmd_dec_volume();
+		} else if (key == KEY_LEFT) {
+			
+		} else if (key == KEY_RIGHT) {
+			
+		} else {
+			printf("Unbound key: %i\n", key);
 		}
 	}
 
