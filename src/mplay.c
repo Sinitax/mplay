@@ -1,11 +1,11 @@
+#define MINIMP3_IMPLEMENTATION
+#include "minimp3.h"
+
 #include <pulse/introspect.h>
 #include <pulse/operation.h>
 #include <pulse/stream.h>
 #include <pulse/thread-mainloop.h>
 #include <pulse/volume.h>
-#define MINIMP3_IMPLEMENTATION
-#include "minimp3.h"
-
 #include <pulse/pulseaudio.h>
 #include <pulse/def.h>
 
@@ -24,11 +24,15 @@
 enum {
 	KEY_NONE = 0,
 	KEY_BRK = 3,
-	KEY_QUIT = 0x100,
+	KEY_EOF = 0x100,
 	KEY_LEFT,
 	KEY_RIGHT,
 	KEY_UP,
 	KEY_DOWN,
+};
+
+enum {
+	CMD_QUIT
 };
 
 #define ERR(...) err(1, __VA_ARGS__)
@@ -47,7 +51,7 @@ static pa_buffer_attr pa_buf = {
 	.fragsize = UINT32_MAX,
 	.maxlength = UINT32_MAX,
 	.tlength = UINT32_MAX,
-	.prebuf = 0,
+	.prebuf = UINT32_MAX,
 	.minreq = UINT32_MAX,
 };
 static pa_stream_flags_t pa_stream_flags =
@@ -59,6 +63,8 @@ static pa_context *pa_ctx;
 static pa_stream *pa_strm;
 static pa_sink_input_info pa_strm_info;
 static bool pa_strm_info_update;
+
+static bool cmd_input_mode = false;
 
 static struct {
 	uint8_t *data;
@@ -95,8 +101,8 @@ int decode_next_frame(mp3d_sample_t *samples);
 static pthread_t input_worker_thread;
 static pthread_t pa_worker_thread;
 
-static struct termios term_old;
-static struct termios term_new;
+static struct termios term_orig;
+static struct termios term_raw;
 static bool term_set = false;
 
 static int exitcode;
@@ -117,7 +123,7 @@ map_file(const char *path, size_t *len)
 	if ((attr.st_mode & S_IFMT) == S_IFDIR)
 		ERRX("not a file: %s", path);
 
-	buf = mmap(NULL, attr.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	buf = mmap(NULL, attr.st_size, PROT_READ, MAP_SHARED, fd, 0);
 	if (!buf) ERR("mmap %s", path);
 
 	*len = attr.st_size;
@@ -155,19 +161,25 @@ decoder_init(void)
 int
 decode_next_frame(mp3d_sample_t *samples)
 {
+	static const int max_cnt = MINIMP3_MAX_SAMPLES_PER_FRAME;
 	mp3dec_frame_info_t info;
 	int cnt;
 
 	if (mp3d.sample_next < mp3d.sample_cnt) {
-		cnt = MIN(MINIMP3_MAX_SAMPLES_PER_FRAME,
-			mp3d.sample_cnt - mp3d.sample_next);
-		memcpy(samples, &mp3d.samples[mp3d.sample_next],
-			cnt * sizeof(mp3d_sample_t));
-		mp3d.sample_next += cnt;
+		cnt = MIN(max_cnt, mp3d.sample_cnt - mp3d.sample_next);
 	} else {
-		cnt = mp3dec_decode_frame(&mp3d.dec,
-			mp3d.pos, mp3d.left, samples, &info);
+		if (mp3d.sample_cnt + max_cnt > mp3d.sample_cap) {
+			mp3d.sample_cap = MAX(mp3d.sample_cap * 2,
+				mp3d.sample_cnt + max_cnt);
+			mp3d.samples = realloc(mp3d.samples,
+				mp3d.sample_cap * sizeof(mp3d_sample_t));
+			if (!mp3d.samples) ERR("realloc");
+		}
+
+		cnt = mp3dec_decode_frame(&mp3d.dec, mp3d.pos, mp3d.left,
+			&mp3d.samples[mp3d.sample_cnt], &info);
 		cnt *= info.channels;
+		mp3d.sample_cnt += cnt;
 
 		if (mp3d.pos == audiofile.data && !cnt) {
 			warnx("MP3 decode error");
@@ -180,22 +192,14 @@ decode_next_frame(mp3d_sample_t *samples)
 			mp3d.channels = info.channels;
 		}
 
-		if (mp3d.sample_cnt + cnt > mp3d.sample_cap) {
-			mp3d.sample_cap = MAX(mp3d.sample_cap * 2,
-				mp3d.sample_cnt + cnt);
-			mp3d.samples = realloc(mp3d.samples,
-				mp3d.sample_cap * sizeof(mp3d_sample_t));
-			if (!mp3d.samples) ERR("realloc");
-		}
-		memcpy(&mp3d.samples[mp3d.sample_cnt], samples,
-			cnt * sizeof(mp3d_sample_t));
-		mp3d.sample_cnt += cnt;
-
 		mp3d.pos += info.frame_bytes;
 		mp3d.left -= info.frame_bytes;
-
-		mp3d.sample_next += cnt;
 	}
+
+	if (samples != NULL)
+		memcpy(samples, &mp3d.samples[mp3d.sample_next],
+			cnt * sizeof(mp3d_sample_t));
+	mp3d.sample_next += cnt;
 
 	return cnt;
 }
@@ -203,44 +207,13 @@ decode_next_frame(mp3d_sample_t *samples)
 void
 decoder_seek(size_t sample_pos)
 {
-	mp3d_sample_t samples[MINIMP3_MAX_SAMPLES_PER_FRAME];
 	int cnt;
 
 	while (mp3d.sample_next < sample_pos) {
-		cnt = decode_next_frame(samples);
+		cnt = decode_next_frame(NULL);
 		if (!cnt) exit(0);
 	}
 	mp3d.sample_next = sample_pos;
-}
-
-void
-context_poll_until(pa_context_state_t target_state)
-{
-	pa_context_state_t state;
-
-	while (true) {
-		pa_threaded_mainloop_lock(pa_mloop);
-		state = pa_context_get_state(pa_ctx);
-		pa_threaded_mainloop_unlock(pa_mloop);
-		if (state == target_state)
-			break;
-		pa_threaded_mainloop_wait(pa_mloop);
-	}
-}
-
-void
-stream_poll_until(pa_stream_state_t target_state)
-{
-	pa_stream_state_t state;
-
-	while (true) {
-		pa_threaded_mainloop_lock(pa_mloop);
-		state = pa_stream_get_state(pa_strm);
-		pa_threaded_mainloop_unlock(pa_mloop);
-		if (state == target_state)
-			break;
-		pa_threaded_mainloop_wait(pa_mloop);
-	}
 }
 
 void
@@ -265,7 +238,9 @@ update_sink_input_info(void)
 	if (!op) PA_ERRX("pa_context_get_sink_input_info failed");
 
 	while (!pa_strm_info_update) {
+		pa_threaded_mainloop_unlock(pa_mloop);
 		pa_threaded_mainloop_wait(pa_mloop);
+		pa_threaded_mainloop_lock(pa_mloop);
 	}
 
 	pa_operation_unref(op);
@@ -283,6 +258,8 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 
 	if (!mp3d.left) {
 		info = pa_stream_get_timing_info(pa_strm);
+		if (info->read_index_corrupt || info->write_index_corrupt)
+			return;
 		if (info->read_index >= info->write_index)
 			exit(0);
 	}
@@ -302,12 +279,25 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 }
 
 double
-get_track_time(void)
+user_vol(void)
+{
+	pa_volume_t vol;
+
+	update_sink_input_info();
+	vol = pa_cvolume_avg(&pa_strm_info.volume);
+
+	return vol * 100.F / PA_VOLUME_NORM;
+}
+
+double
+user_time(void)
 {
 	pa_usec_t time;
 
 	pa_stream_get_time(pa_strm, &time);
-	return (time - mp3d.seek_stream_time + mp3d.seek_track_time) / 1000000.F;
+	time = time - mp3d.seek_stream_time + mp3d.seek_track_time;
+
+	return time / 1000000.F;
 }
 
 ssize_t
@@ -323,21 +313,12 @@ stream_samples_buffered(void)
 }
 
 void
-cmd_volume(float delta)
+cmd_setvol(double vol)
 {
 	pa_operation *op;
 
-	pa_threaded_mainloop_lock(pa_mloop);
-
 	update_sink_input_info();
-
-	if (delta > 0) {
-		pa_cvolume_inc(&pa_strm_info.volume,
-			delta * PA_VOLUME_NORM / 100);
-	} else {
-		pa_cvolume_dec(&pa_strm_info.volume,
-			-delta * PA_VOLUME_NORM / 100);
-	}
+	pa_cvolume_set(&pa_strm_info.volume, 2, vol * PA_VOLUME_NORM / 100.F);
 	if (pa_cvolume_avg(&pa_strm_info.volume) > 2 * PA_VOLUME_NORM)
 		pa_cvolume_set(&pa_strm_info.volume, 2, 2 * PA_VOLUME_NORM);
 
@@ -346,23 +327,18 @@ cmd_volume(float delta)
 		&pa_strm_info.volume, NULL, NULL);
 	pa_operation_unref(op);
 
-	printf("VOLUME: %02.2f\n", pa_cvolume_avg(&pa_strm_info.volume)
+	printf("+VOLUME: %02.2f\n", pa_cvolume_avg(&pa_strm_info.volume)
 		* 100.f / PA_VOLUME_NORM);
-
-	pa_threaded_mainloop_unlock(pa_mloop);
 }
 
 void
-cmd_seek(float delta)
+cmd_seek(double time_sec)
 {
 	ssize_t sample_pos;
 	pa_operation *op;
 	int64_t index;
 
-	pa_threaded_mainloop_lock(pa_mloop);
-
-	sample_pos = MAX(0, (ssize_t) mp3d.sample_next +
-		delta * mp3d.channels * mp3d.rate - stream_samples_buffered());
+	sample_pos = MAX(0, time_sec * mp3d.channels * mp3d.rate);
 	decoder_seek(sample_pos);
 	op = pa_stream_flush(pa_strm, NULL, NULL);
 	pa_operation_unref(op);
@@ -372,34 +348,28 @@ cmd_seek(float delta)
 	mp3d.seek_track_time = mp3d.sample_next * 1000000.F
 		/ (mp3d.channels * mp3d.rate);
 
-	printf("SEEK: %02.2f\n", mp3d.seek_track_time / 1000000.F);
-
-	pa_threaded_mainloop_unlock(pa_mloop);
+	printf("+SEEK: %02.2f\n", mp3d.seek_track_time / 1000000.F);
 }
 
 void
-cmd_pause(void)
+cmd_pause_toggle(void)
 {
 	ssize_t sample_pos;
 	pa_operation *op;
 
-	pa_threaded_mainloop_lock(pa_mloop);
 	mp3d.pause ^= 1;
 	op = pa_stream_cork(pa_strm, mp3d.pause, NULL, NULL);
 	pa_operation_unref(op);
-	printf("PAUSE: %i\n", mp3d.pause);
-	pa_threaded_mainloop_unlock(pa_mloop);
+	printf("+PAUSE: %i\n", mp3d.pause);
 }
 
 void
 cmd_status(void)
 {
-	pa_threaded_mainloop_lock(pa_mloop);
 	update_sink_input_info();
-	printf("STATUS: vol:%02.2f pos:%02.2f pause:%i\n",
+	printf("+STATUS: vol:%02.2f pos:%02.2f pause:%i\n",
 		pa_cvolume_avg(&pa_strm_info.volume) * 100.0 / PA_VOLUME_NORM,
-		get_track_time(), mp3d.pause);
-	pa_threaded_mainloop_unlock(pa_mloop);
+		user_time(), mp3d.pause);
 }
 
 int
@@ -418,7 +388,7 @@ getkey_esc(void)
 	case 'D':
 		return KEY_LEFT;
 	case EOF:
-		return KEY_QUIT;
+		return KEY_EOF;
 	default:
 		return KEY_NONE;
 	}
@@ -444,53 +414,131 @@ getkey(void)
 	}
 }
 
+bool
+cmd_input(void)
+{
+	char linebuf[256];
+	char *end, *tok;
+	float input;
+
+	if (!fgets(linebuf, sizeof(linebuf), stdin))
+		return false;
+
+	tok = strchr(linebuf, '\n');
+	if (tok) *tok = '\0';
+
+	pa_threaded_mainloop_lock(pa_mloop);
+
+	if (!strncmp(linebuf, "seek ", 5)) {
+		input = strtof(linebuf + 5, &end);
+		if (!end || end && *end) {
+			printf("Invalid input\n");
+			goto exit;
+		}
+		cmd_seek(input);
+	} else if (!strncmp(linebuf, "vol ", 4)) {
+		input = strtof(linebuf + 4, &end);
+		if (!end || end && *end) {
+			printf("Invalid input\n");
+			goto exit;
+		}
+		cmd_setvol(input);
+	} else if (!strcmp(linebuf, "status")) {
+		cmd_status();
+	} else if (!strcmp(linebuf, "pause")) {
+		cmd_pause_toggle();
+	} else if (!strcmp(linebuf, "key")) {
+		cmd_input_mode = false;
+		if (term_set)
+			tcsetattr(0, TCSANOW, &term_raw);
+		printf("+CMDINPUT: 0\n");
+	} else {
+		printf("Invalid command\n");
+	}
+
+exit:
+	pa_threaded_mainloop_unlock(pa_mloop);
+	return true;
+}
+
+bool
+key_input(void)
+{
+	int key;
+
+	while (!(key = getkey()));
+	if (key == 'q' || key == KEY_EOF)
+		return false;
+
+	pa_threaded_mainloop_lock(pa_mloop);
+
+	switch (key) {
+	case KEY_UP:
+	case '+':
+		cmd_setvol(user_vol() + 5);
+		break;
+	case KEY_DOWN:
+	case '-':
+		cmd_setvol(user_vol() - 5);
+		break;
+	case KEY_LEFT:
+		cmd_seek(user_time() - 5);
+		break;
+	case KEY_RIGHT:
+		cmd_seek(user_time() + 5);
+		break;
+	case 'c':
+		cmd_pause_toggle();
+		break;
+	case 's':
+		cmd_status();
+		break;
+	case 'i':
+		cmd_input_mode = true;
+		printf("+CMDINPUT: 1\n");
+		if (term_set)
+			tcsetattr(0, TCSANOW, &term_orig);
+		break;
+	default:
+		printf("Unbound key: %i\n", key);
+		break;
+	}
+
+	pa_threaded_mainloop_unlock(pa_mloop);
+
+	return true;
+}
+
 void *
 input_worker(void *arg)
 {
 	int key;
 
-	if (tcgetattr(0, &term_old))
-		ERR("tcgetattr");
-	term_set = true;
+	setvbuf(stdin, NULL, _IONBF, 0);
+	setvbuf(stdout, NULL, _IONBF, 0);
 
-	term_new = term_old;
-	term_new.c_iflag |= BRKINT;
-	term_new.c_iflag &= ~IGNBRK;
-	term_new.c_lflag &= ~ICANON;
-	term_new.c_lflag &= ~ECHO;
+	if (!tcgetattr(0, &term_orig))
+		term_set = true;
 
-	if (tcsetattr(0, TCSANOW, &term_new))
-		ERR("tcsetattr");
+	term_raw = term_orig;
+	term_raw.c_iflag |= BRKINT;
+	term_raw.c_iflag &= ~IGNBRK;
+	term_raw.c_lflag &= ~ICANON;
+	term_raw.c_lflag &= ~ECHO;
+
+	cmd_input_mode = true;
+	//if (tcsetattr(0, TCSANOW, &term_raw))
+	//	ERR("tcsetattr");
+
+	printf("+READY\n");
 
 	while (true) {
-		while (!(key = getkey()));
-		switch (key) {
-		case KEY_UP:
-		case '+':
-			cmd_volume(+5);
-			break;
-		case KEY_DOWN:
-		case '-':
-			cmd_volume(-5);
-			break;
-		case KEY_LEFT:
-			cmd_seek(-5);
-			break;
-		case KEY_RIGHT:
-			cmd_seek(+5);
-			break;
-		case 'c':
-			cmd_pause();
-			break;
-		case 's':
-			cmd_status();
-			break;
-		case KEY_QUIT:
-		case 'q':
-			return NULL;
-		default:
-			printf("Unbound key: %i\n", key);
-			break;
+		if (cmd_input_mode) {
+			if (!cmd_input())
+				break;
+		} else {
+			if (!key_input())
+				break;
 		}
 	}
 
@@ -498,12 +546,10 @@ input_worker(void *arg)
 }
 
 void
-context_init(void)
+pulse_context_init(void)
 {
 	pa_mainloop_api *pa_mloop_api;
 	int ret;
-
-	pa_threaded_mainloop_lock(pa_mloop);
 
 	pa_mloop_api = pa_threaded_mainloop_get_api(pa_mloop);
 	if (!pa_mloop_api) ERRX("pa_threaded_mainloop_get_api");
@@ -515,21 +561,21 @@ context_init(void)
 	if (ret) ERRX("pa_context_connect: %s",
 		pa_strerror(pa_context_errno(pa_ctx)));
 
-	pa_threaded_mainloop_unlock(pa_mloop);
-
-	context_poll_until(PA_CONTEXT_READY);
+	while (pa_context_get_state(pa_ctx) != PA_CONTEXT_READY) {
+		pa_threaded_mainloop_unlock(pa_mloop);
+		pa_threaded_mainloop_wait(pa_mloop);
+		pa_threaded_mainloop_lock(pa_mloop);
+	}
 }
 
 void
-stream_init(void)
+pulse_stream_init(void)
 {
 	pa_channel_map pa_chmap;
 	pa_context_state_t state;
 	int ret;
 
 	pa_channel_map_init_stereo(&pa_chmap);
-
-	pa_threaded_mainloop_lock(pa_mloop);
 
 	pa_strm = pa_stream_new(pa_ctx, "mplay", &pa_spec, &pa_chmap);
 	if (!pa_strm) ERRX("pa_stream_new: %s",
@@ -541,9 +587,11 @@ stream_init(void)
 		&pa_buf, pa_stream_flags, NULL, NULL);
 	if (ret) ERRX("pa_stream_connect_playback failed");
 
-	pa_threaded_mainloop_unlock(pa_mloop);
-
-	stream_poll_until(PA_STREAM_READY);
+	while (pa_stream_get_state(pa_strm) != PA_STREAM_READY) {
+		pa_threaded_mainloop_unlock(pa_mloop);
+		pa_threaded_mainloop_wait(pa_mloop);
+		pa_threaded_mainloop_lock(pa_mloop);
+	}
 }
 
 void
@@ -556,7 +604,7 @@ void
 term_reset(void)
 {
 	if (term_set)
-		tcsetattr(0, TCSANOW, &term_old);
+		tcsetattr(0, TCSANOW, &term_orig);
 }
 
 int
@@ -582,10 +630,9 @@ main(int argc, const char **argv)
 
 	pa_threaded_mainloop_start(pa_mloop);
 
-	context_init();
-	stream_init();
-
 	pa_threaded_mainloop_lock(pa_mloop);
+	pulse_context_init();
+	pulse_stream_init();
 	pa_stream_cork(pa_strm, 0, NULL, NULL);
 	pa_threaded_mainloop_unlock(pa_mloop);
 
