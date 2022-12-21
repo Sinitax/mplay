@@ -308,6 +308,9 @@ user_vol(void)
 	pa_volume_t vol;
 
 	update_sink_input_info();
+	if (!pa_strm_sink.has_volume)
+		return -1;
+
 	vol = pa_cvolume_avg(&pa_strm_sink.volume);
 
 	return vol * 100.F / PA_VOLUME_NORM;
