@@ -641,7 +641,7 @@ main(int argc, const char **argv)
 
 	if (!file) usage();
 
-	audiofile.data = map_file(argv[1], &audiofile.len);
+	audiofile.data = map_file(file, &audiofile.len);
 	decoder_init();
 
 	pa_spec.channels = mp3d.channels;
