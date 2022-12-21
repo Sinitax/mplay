@@ -1,6 +1,7 @@
 #define MINIMP3_IMPLEMENTATION
 #include "minimp3.h"
 
+#include <pulse/sample.h>
 #include <pulse/introspect.h>
 #include <pulse/operation.h>
 #include <pulse/stream.h>
@@ -21,6 +22,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define ERR(...) err(1, __VA_ARGS__)
+#define ERRX(...) errx(1, __VA_ARGS__)
+
 enum {
 	KEY_NONE = 0,
 	KEY_BRK = 3,
@@ -35,43 +39,12 @@ enum {
 	CMD_QUIT
 };
 
-#define ERR(...) err(1, __VA_ARGS__)
-#define ERRX(...) errx(1, __VA_ARGS__)
-#define PA_ERRX(...) do { \
-		warnx(__VA_ARGS__); \
-		exit(1); \
-	} while (0)
-
-static pa_sample_spec pa_spec = {
-	.format = PA_SAMPLE_S16LE,
-	.rate = 44100,
-	.channels = 2
-};
-static pa_buffer_attr pa_buf = {
-	.fragsize = UINT32_MAX,
-	.maxlength = UINT32_MAX,
-	.tlength = UINT32_MAX,
-	.prebuf = UINT32_MAX,
-	.minreq = UINT32_MAX,
-};
-static pa_stream_flags_t pa_stream_flags =
-	PA_STREAM_START_CORKED | PA_STREAM_INTERPOLATE_TIMING |
-	PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_ADJUST_LATENCY;
-
-static pa_threaded_mainloop *pa_mloop;
-static pa_context *pa_ctx;
-static pa_stream *pa_strm;
-static pa_sink_input_info pa_strm_info;
-static bool pa_strm_info_update;
-
-static bool cmd_input_mode = false;
-
-static struct {
+struct audiofile {
 	uint8_t *data;
 	size_t len;
-} audiofile;
+};
 
-static struct {
+struct mp3d {
 	mp3dec_t dec;
 	uint8_t *pos;
 	ssize_t left;
@@ -83,23 +56,48 @@ static struct {
 	size_t sample_next;
 
 	bool seek;
-	pa_usec_t seek_stream_time;
-	pa_usec_t seek_track_time;
 
 	int rate;
 	int channels;
 
 	bool init;
 	bool pause;
-	int err;
-} mp3d;
+};
 
 void decoder_init(void);
 void decoder_seek(size_t sample_pos);
-int decode_next_frame(mp3d_sample_t *samples);
+int decode_next_frame(mp3d_sample_t *samples, int *size);
+
+static pa_sample_spec pa_spec = {
+	.format = PA_SAMPLE_S16LE,
+	.rate = 44100,
+	.channels = 2
+};
+
+static pa_buffer_attr pa_buf = {
+	.fragsize = UINT32_MAX,
+	.maxlength = UINT32_MAX,
+	.tlength = UINT32_MAX,
+	.prebuf = UINT32_MAX,
+	.minreq = UINT32_MAX,
+};
+
+static pa_stream_flags_t pa_stream_flags = PA_STREAM_START_CORKED
+	| PA_STREAM_AUTO_TIMING_UPDATE | PA_STREAM_ADJUST_LATENCY;
+
+static pa_threaded_mainloop *pa_mloop;
+static pa_context *pa_ctx;
+static pa_stream *pa_strm;
+static pa_sink_input_info pa_strm_sink;
+static bool pa_strm_sink_update;
+
+static bool cmd_input_mode = false;
+
+static struct audiofile audiofile = { 0 };
+
+static struct mp3d mp3d = { 0 };
 
 static pthread_t input_worker_thread;
-static pthread_t pa_worker_thread;
 
 static struct termios term_orig;
 static struct termios term_raw;
@@ -136,6 +134,8 @@ map_file(const char *path, size_t *len)
 void
 decoder_init(void)
 {
+	int size;
+
 	mp3d_sample_t samples[MINIMP3_MAX_SAMPLES_PER_FRAME];
 
 	mp3dec_init(&mp3d.dec);
@@ -149,24 +149,29 @@ decoder_init(void)
 	if (!mp3d.samples) ERR("malloc");
 
 	/* decode channel specs */
-	if (!decode_next_frame(samples))
+	decode_next_frame(samples, &size);
+	if (!size) {
+		printf("+EXIT: Invalid mp3\n");
 		exit(1);
+	}
 
-	mp3d.err = 0;
 	mp3d.seek = false;
 	mp3d.pause = false;
 	mp3d.init = true;
 }
 
 int
-decode_next_frame(mp3d_sample_t *samples)
+decode_next_frame(mp3d_sample_t *samples, int *size)
 {
 	static const int max_cnt = MINIMP3_MAX_SAMPLES_PER_FRAME;
 	mp3dec_frame_info_t info;
 	int cnt;
 
+	if (size) *size = 0;
+
 	if (mp3d.sample_next < mp3d.sample_cnt) {
 		cnt = MIN(max_cnt, mp3d.sample_cnt - mp3d.sample_next);
+		*size = cnt * sizeof(mp3d_sample_t);
 	} else {
 		if (mp3d.sample_cnt + max_cnt > mp3d.sample_cap) {
 			mp3d.sample_cap = MAX(mp3d.sample_cap * 2,
@@ -181,11 +186,10 @@ decode_next_frame(mp3d_sample_t *samples)
 		cnt *= info.channels;
 		mp3d.sample_cnt += cnt;
 
-		if (mp3d.pos == audiofile.data && !cnt) {
-			warnx("MP3 decode error");
-			mp3d.err = 1;
+		if (size) *size = info.frame_bytes;
+
+		if (!info.frame_bytes)
 			return 0;
-		}
 
 		if (!mp3d.init) {
 			mp3d.rate = info.hz;
@@ -207,23 +211,51 @@ decode_next_frame(mp3d_sample_t *samples)
 void
 decoder_seek(size_t sample_pos)
 {
-	int cnt;
+	int size, cnt;
 
 	while (mp3d.sample_next < sample_pos) {
-		cnt = decode_next_frame(NULL);
-		if (!cnt) exit(0);
+		cnt = decode_next_frame(NULL, &size);
+		if (!size) {
+			printf("+EXIT: End of file (seek)\n");
+			exit(0);
+		}
 	}
 	mp3d.sample_next = sample_pos;
 }
 
 void
+pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
+{
+	mp3d_sample_t samples[MINIMP3_MAX_SAMPLES_PER_FRAME];
+	ssize_t remaining;
+	int cnt, size;
+
+	remaining = requested;
+	while (remaining > 0) {
+		cnt = decode_next_frame(samples, &size);
+		if (!size) {
+			printf("+EXIT: End of file\n");
+			exit(0);
+		}
+		if (!cnt) continue;
+
+		pa_stream_write(stream, samples,
+			cnt * sizeof(mp3d_sample_t), NULL, 0,
+			mp3d.seek ? PA_SEEK_RELATIVE_ON_READ: PA_SEEK_RELATIVE);
+
+		mp3d.seek = false;
+		remaining -= cnt * sizeof(mp3d_sample_t);
+	}
+}
+void
+
 update_sink_input_info_callback(struct pa_context *ctx,
 	const pa_sink_input_info *info, int eol, void *data)
 {
 	if (eol) return;
-	memcpy(&pa_strm_info, info, sizeof(pa_sink_input_info));
-	pa_strm_info_update = true;
-	pa_threaded_mainloop_signal(pa_mloop, 1);
+	memcpy(&pa_strm_sink, info, sizeof(pa_sink_input_info));
+	pa_strm_sink_update = true;
+	pa_threaded_mainloop_signal(pa_mloop, true);
 }
 
 void
@@ -231,13 +263,13 @@ update_sink_input_info(void)
 {
 	pa_operation *op;
 
-	pa_strm_info_update = false;
+	pa_strm_sink_update = false;
 	op = pa_context_get_sink_input_info(pa_ctx,
 		pa_stream_get_index(pa_strm),
 		update_sink_input_info_callback, NULL);
-	if (!op) PA_ERRX("pa_context_get_sink_input_info failed");
+	if (!op) ERRX("pa_context_get_sink_input_info failed");
 
-	while (!pa_strm_info_update) {
+	while (!pa_strm_sink_update) {
 		pa_threaded_mainloop_unlock(pa_mloop);
 		pa_threaded_mainloop_wait(pa_mloop);
 		pa_threaded_mainloop_lock(pa_mloop);
@@ -248,34 +280,26 @@ update_sink_input_info(void)
 	pa_threaded_mainloop_accept(pa_mloop);
 }
 
-void
-pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
+ssize_t
+stream_samples_buffered(void)
 {
-	mp3d_sample_t samples[MINIMP3_MAX_SAMPLES_PER_FRAME];
+	static size_t last_read_index = 0, last_write_index = 0;
 	const pa_timing_info *info;
-	ssize_t remaining;
-	int cnt, channels;
+	size_t buffered;
 
-	if (!mp3d.left) {
-		info = pa_stream_get_timing_info(pa_strm);
-		if (info->read_index_corrupt || info->write_index_corrupt)
-			return;
-		if (info->read_index >= info->write_index)
-			exit(0);
-	}
+	info = pa_stream_get_timing_info(pa_strm);
+	if (!info || info->write_index_corrupt || info->read_index_corrupt)
+		return 0;
 
-	remaining = requested;
-	while (remaining > 0 && mp3d.left > 0) {
-		cnt = decode_next_frame(samples);
-		if (!cnt) exit(mp3d.err);
+	if (info->read_index != last_read_index)
+		last_write_index = info->write_index;
 
-		pa_stream_write(stream, samples,
-			cnt * sizeof(mp3d_sample_t), NULL, 0,
-			mp3d.seek ? PA_SEEK_RELATIVE_ON_READ: PA_SEEK_RELATIVE);
+	buffered = (last_write_index - last_read_index)
+		/ sizeof(mp3d_sample_t);
 
-		mp3d.seek = false;
-		remaining -= cnt * sizeof(mp3d_sample_t);
-	}
+	last_read_index = info->read_index;
+
+	return buffered;
 }
 
 double
@@ -284,7 +308,7 @@ user_vol(void)
 	pa_volume_t vol;
 
 	update_sink_input_info();
-	vol = pa_cvolume_avg(&pa_strm_info.volume);
+	vol = pa_cvolume_avg(&pa_strm_sink.volume);
 
 	return vol * 100.F / PA_VOLUME_NORM;
 }
@@ -292,24 +316,11 @@ user_vol(void)
 double
 user_time(void)
 {
-	pa_usec_t time;
+	ssize_t sample_pos;
 
-	pa_stream_get_time(pa_strm, &time);
-	time = time - mp3d.seek_stream_time + mp3d.seek_track_time;
+	sample_pos = MAX(0, mp3d.sample_next - stream_samples_buffered());
 
-	return time / 1000000.F;
-}
-
-ssize_t
-stream_samples_buffered(void)
-{
-	const pa_timing_info *info;
-
-	info = pa_stream_get_timing_info(pa_strm);
-	if (info->write_index_corrupt || info->read_index_corrupt)
-		return 0;
-
-	return (info->write_index - info->read_index) / sizeof(mp3d_sample_t);
+	return sample_pos * 1.F / (mp3d.rate * mp3d.channels);
 }
 
 void
@@ -318,16 +329,16 @@ cmd_setvol(double vol)
 	pa_operation *op;
 
 	update_sink_input_info();
-	pa_cvolume_set(&pa_strm_info.volume, 2, vol * PA_VOLUME_NORM / 100.F);
-	if (pa_cvolume_avg(&pa_strm_info.volume) > 2 * PA_VOLUME_NORM)
-		pa_cvolume_set(&pa_strm_info.volume, 2, 2 * PA_VOLUME_NORM);
+	pa_cvolume_set(&pa_strm_sink.volume, 2, vol * PA_VOLUME_NORM / 100.F);
+	if (pa_cvolume_avg(&pa_strm_sink.volume) > 2 * PA_VOLUME_NORM)
+		pa_cvolume_set(&pa_strm_sink.volume, 2, 2 * PA_VOLUME_NORM);
 
 	op = pa_context_set_sink_input_volume(pa_ctx,
 		pa_stream_get_index(pa_strm),
-		&pa_strm_info.volume, NULL, NULL);
+		&pa_strm_sink.volume, NULL, NULL);
 	pa_operation_unref(op);
 
-	printf("+VOLUME: %02.2f\n", pa_cvolume_avg(&pa_strm_info.volume)
+	printf("+VOLUME: %02.2f\n", pa_cvolume_avg(&pa_strm_sink.volume)
 		* 100.f / PA_VOLUME_NORM);
 }
 
@@ -336,30 +347,27 @@ cmd_seek(double time_sec)
 {
 	ssize_t sample_pos;
 	pa_operation *op;
-	int64_t index;
 
-	sample_pos = MAX(0, time_sec * mp3d.channels * mp3d.rate);
+	if (time_sec < 0) time_sec = 0;
+	sample_pos = time_sec * mp3d.channels * mp3d.rate;
 	decoder_seek(sample_pos);
+
 	op = pa_stream_flush(pa_strm, NULL, NULL);
 	pa_operation_unref(op);
-
 	mp3d.seek = true;
-	pa_stream_get_time(pa_strm, &mp3d.seek_stream_time);
-	mp3d.seek_track_time = mp3d.sample_next * 1000000.F
-		/ (mp3d.channels * mp3d.rate);
 
-	printf("+SEEK: %02.2f\n", mp3d.seek_track_time / 1000000.F);
+	printf("+SEEK: %02.2f\n", user_time());
 }
 
 void
 cmd_pause_toggle(void)
 {
-	ssize_t sample_pos;
 	pa_operation *op;
 
 	mp3d.pause ^= 1;
 	op = pa_stream_cork(pa_strm, mp3d.pause, NULL, NULL);
 	pa_operation_unref(op);
+
 	printf("+PAUSE: %i\n", mp3d.pause);
 }
 
@@ -367,9 +375,9 @@ void
 cmd_status(void)
 {
 	update_sink_input_info();
+
 	printf("+STATUS: vol:%02.2f pos:%02.2f pause:%i\n",
-		pa_cvolume_avg(&pa_strm_info.volume) * 100.0 / PA_VOLUME_NORM,
-		user_time(), mp3d.pause);
+		user_vol(), user_time(), mp3d.pause);
 }
 
 int
@@ -512,8 +520,6 @@ key_input(void)
 void *
 input_worker(void *arg)
 {
-	int key;
-
 	setvbuf(stdin, NULL, _IONBF, 0);
 	setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -526,9 +532,10 @@ input_worker(void *arg)
 	term_raw.c_lflag &= ~ICANON;
 	term_raw.c_lflag &= ~ECHO;
 
-	cmd_input_mode = true;
-	//if (tcsetattr(0, TCSANOW, &term_raw))
-	//	ERR("tcsetattr");
+	if (!cmd_input_mode) {
+		if (tcsetattr(0, TCSANOW, &term_raw))
+			ERR("tcsetattr");
+	}
 
 	printf("+READY\n");
 
@@ -572,7 +579,6 @@ void
 pulse_stream_init(void)
 {
 	pa_channel_map pa_chmap;
-	pa_context_state_t state;
 	int ret;
 
 	pa_channel_map_init_stereo(&pa_chmap);
@@ -607,17 +613,30 @@ term_reset(void)
 		tcsetattr(0, TCSANOW, &term_orig);
 }
 
+void
+usage(void)
+{
+	fprintf(stderr, "Usage: mplay [-i] FILE\n");
+	exit(1);
+}
+
 int
 main(int argc, const char **argv)
 {
-	pa_context_state_t pa_ctx_state;
-	struct sigaction act;
-	int ret;
+	const char **arg;
+	const char *file;
 
-	if (argc != 2) {
-		printf("USAGE: mplay FILE\n");
-		return 1;
+	file = NULL;
+	for (arg = argv + 1; *arg; arg++) {
+		if (!strcmp(*arg, "-i")) {
+			cmd_input_mode = true;
+		} else {
+			if (file) usage();
+			file = *arg;
+		}
 	}
+
+	if (!file) usage();
 
 	audiofile.data = map_file(argv[1], &audiofile.len);
 	decoder_init();

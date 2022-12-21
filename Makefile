@@ -1,4 +1,4 @@
-CFLAGS = -g -I src -I lib/minimp3/
+CFLAGS = -g -I src -I lib/minimp3/ -Wunused-variable
 LDLIBS = -lpulse -lpulse-simple
 
 PREFIX ?= /usr/local
