@@ -91,8 +91,6 @@ static pa_stream *pa_strm;
 static pa_sink_input_info pa_strm_sink;
 static bool pa_strm_sink_update;
 
-static bool cmd_input_mode = false;
-
 static struct audiofile audiofile = { 0 };
 
 static struct mp3d mp3d = { 0 };
@@ -103,7 +101,8 @@ static struct termios term_orig;
 static struct termios term_raw;
 static bool term_set = false;
 
-static int exitcode;
+static bool cmd_input_mode = false;
+static bool use_stdio = true;
 
 uint8_t *
 map_file(const char *path, size_t *len)
@@ -224,9 +223,17 @@ decoder_seek(size_t sample_pos)
 }
 
 void
+pa_stream_drain_callback(pa_stream *stream, int success, void *data)
+{
+	printf("+EXIT: End of file\n");
+	exit(0);
+}
+
+void
 pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 {
 	mp3d_sample_t samples[MINIMP3_MAX_SAMPLES_PER_FRAME];
+	pa_operation *op;
 	ssize_t remaining;
 	int cnt, size;
 
@@ -234,8 +241,10 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 	while (remaining > 0) {
 		cnt = decode_next_frame(samples, &size);
 		if (!size) {
-			printf("+EXIT: End of file\n");
-			exit(0);
+			op = pa_stream_drain(pa_strm,
+				pa_stream_drain_callback, NULL);
+			pa_operation_unref(op);
+			return;
 		}
 		if (!cnt) continue;
 
@@ -247,8 +256,8 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 		remaining -= cnt * sizeof(mp3d_sample_t);
 	}
 }
-void
 
+void
 update_sink_input_info_callback(struct pa_context *ctx,
 	const pa_sink_input_info *info, int eol, void *data)
 {
@@ -275,9 +284,9 @@ update_sink_input_info(void)
 		pa_threaded_mainloop_lock(pa_mloop);
 	}
 
-	pa_operation_unref(op);
-
 	pa_threaded_mainloop_accept(pa_mloop);
+
+	pa_operation_unref(op);
 }
 
 ssize_t
@@ -464,7 +473,7 @@ cmd_input(void)
 			tcsetattr(0, TCSANOW, &term_raw);
 		printf("+CMDINPUT: 0\n");
 	} else {
-		printf("Invalid command\n");
+		printf("+INVALID: Invalid command\n");
 	}
 
 exit:
@@ -511,7 +520,7 @@ key_input(void)
 			tcsetattr(0, TCSANOW, &term_orig);
 		break;
 	default:
-		printf("Unbound key: %i\n", key);
+		printf("+INVALID: Invalid command\n");
 		break;
 	}
 
@@ -610,22 +619,31 @@ sigint_handler(int sig)
 }
 
 void
-term_reset(void)
+cleanup(void)
 {
 	if (term_set)
 		tcsetattr(0, TCSANOW, &term_orig);
+
+	pa_stream_disconnect(pa_strm);
+	pa_stream_unref(pa_strm);
+
+	pa_context_disconnect(pa_ctx);
+	pa_context_unref(pa_ctx);
+
+	munmap(audiofile.data, audiofile.len);
 }
 
 void
 usage(void)
 {
-	fprintf(stderr, "Usage: mplay [-i] FILE\n");
+	fprintf(stderr, "Usage: mplay [-h] [-i] FILE\n");
 	exit(1);
 }
 
 int
 main(int argc, const char **argv)
 {
+	pthread_mutex_t lock;
 	const char **arg;
 	const char *file;
 
@@ -633,6 +651,8 @@ main(int argc, const char **argv)
 	for (arg = argv + 1; *arg; arg++) {
 		if (!strcmp(*arg, "-i")) {
 			cmd_input_mode = true;
+		} else if (!strcmp(*arg, "-h")) {
+			use_stdio = false;
 		} else {
 			if (file) usage();
 			file = *arg;
@@ -658,25 +678,18 @@ main(int argc, const char **argv)
 	pa_stream_cork(pa_strm, 0, NULL, NULL);
 	pa_threaded_mainloop_unlock(pa_mloop);
 
-	exitcode = 0;
-	atexit(term_reset);
+	atexit(cleanup);
 	signal(SIGINT, sigint_handler);
 
-	if (pthread_create(&input_worker_thread, NULL, input_worker, NULL))
-		ERR("pthread_create");
-	pthread_join(input_worker_thread, NULL);
+	if (use_stdio) {
+		if (pthread_create(&input_worker_thread, NULL, input_worker, NULL))
+			ERR("pthread_create");
+		pthread_join(input_worker_thread, NULL);
+	} else {
+		pthread_mutex_init(&lock, NULL);
+		pthread_mutex_lock(&lock);
+		pthread_mutex_lock(&lock);
+	}
 
-	pa_threaded_mainloop_stop(pa_mloop);
-
-	pa_stream_disconnect(pa_strm);
-	pa_stream_unref(pa_strm);
-
-	pa_context_disconnect(pa_ctx);
-	pa_context_unref(pa_ctx);
-
-	pa_threaded_mainloop_free(pa_mloop);
-
-	munmap(audiofile.data, audiofile.len);
-
-	return exitcode;
+	return 0;
 }

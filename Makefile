@@ -1,4 +1,4 @@
-CFLAGS = -g -I src -I lib/minimp3/ -Wunused-variable
+CFLAGS = -g -I lib/minimp3/ -Wunused-variable
 LDLIBS = -lpulse -lpulse-simple
 
 PREFIX ?= /usr/local
@@ -9,7 +9,7 @@ all: mplay
 clean:
 	rm -f mplay
 
-mplay: src/mplay.c
+mplay: mplay.c
 	$(CC) -o $@ $^ $(CFLAGS) $(LDLIBS)
 
 install:
