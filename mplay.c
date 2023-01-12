@@ -103,6 +103,7 @@ static bool term_set = false;
 
 static bool cmd_input_mode = false;
 static bool use_stdio = true;
+static bool debug = false;
 
 uint8_t *
 map_file(const char *path, size_t *len)
@@ -255,6 +256,18 @@ pa_stream_write_callback(pa_stream *stream, size_t requested, void *data)
 		mp3d.seek = false;
 		remaining -= cnt * sizeof(mp3d_sample_t);
 	}
+}
+
+void
+pa_stream_underflow_callback(struct pa_stream *stream, void *data)
+{
+	printf("+UNDERFLOW\n");
+}
+
+void
+pa_stream_overflow_callback(struct pa_stream *stream, void *data)
+{
+	printf("+OVERFLOW\n");
 }
 
 void
@@ -601,6 +614,13 @@ pulse_stream_init(void)
 
 	pa_stream_set_write_callback(pa_strm, pa_stream_write_callback, NULL);
 
+	if (debug) {
+		pa_stream_set_underflow_callback(pa_strm,
+			pa_stream_underflow_callback, NULL);
+		pa_stream_set_overflow_callback(pa_strm,
+			pa_stream_overflow_callback, NULL);
+	}
+
 	ret = pa_stream_connect_playback(pa_strm, NULL,
 		&pa_buf, pa_stream_flags, NULL, NULL);
 	if (ret) ERRX("pa_stream_connect_playback failed");
@@ -653,6 +673,8 @@ main(int argc, const char **argv)
 			cmd_input_mode = true;
 		} else if (!strcmp(*arg, "-h")) {
 			use_stdio = false;
+		} else if (!strcmp(*arg, "-d")) {
+			debug = true;
 		} else {
 			if (file) usage();
 			file = *arg;
