@@ -683,6 +683,9 @@ main(int argc, const char **argv)
 
 	if (!file) usage();
 
+	if (strlen(file) < 4 || strcmp(file + strlen(file) - 4, ".mp3"))
+		ERRX("Not a mp3 file");
+
 	audiofile.data = map_file(file, &audiofile.len);
 	decoder_init();
 
