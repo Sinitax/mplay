@@ -22,9 +22,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define ERR(...) err(1, __VA_ARGS__)
-#define ERRX(...) errx(1, __VA_ARGS__)
-
 enum {
 	KEY_NONE = 0,
 	KEY_BRK = 3,
@@ -113,16 +110,16 @@ map_file(const char *path, size_t *len)
 	int fd;
 
 	fd = open(path, O_RDONLY);
-	if (fd < 0) ERR("open %s", path);
+	if (fd < 0) err(1, "open %s", path);
 
 	if (fstat(fd, &attr))
-		ERR("fstat %s", path);
+		err(1, "fstat %s", path);
 
 	if ((attr.st_mode & S_IFMT) == S_IFDIR)
-		ERRX("not a file: %s", path);
+		errx(1, "not a file: %s", path);
 
 	buf = mmap(NULL, attr.st_size, PROT_READ, MAP_SHARED, fd, 0);
-	if (!buf) ERR("mmap %s", path);
+	if (!buf) err(1, "mmap %s", path);
 
 	*len = attr.st_size;
 
@@ -146,14 +143,11 @@ decoder_init(void)
 	mp3d.sample_next = 0;
 	mp3d.sample_cap = MINIMP3_MAX_SAMPLES_PER_FRAME;
 	mp3d.samples = malloc(mp3d.sample_cap * sizeof(mp3d_sample_t));
-	if (!mp3d.samples) ERR("malloc");
+	if (!mp3d.samples) err(1, "malloc");
 
 	/* decode channel specs */
 	decode_next_frame(samples, &size);
-	if (!size) {
-		printf("+EXIT: Invalid mp3\n");
-		exit(1);
-	}
+	if (!size) errx(1, "Invalid mp3");
 
 	mp3d.seek = false;
 	mp3d.pause = false;
@@ -178,7 +172,7 @@ decode_next_frame(mp3d_sample_t *samples, int *size)
 				mp3d.sample_cnt + max_cnt);
 			mp3d.samples = realloc(mp3d.samples,
 				mp3d.sample_cap * sizeof(mp3d_sample_t));
-			if (!mp3d.samples) ERR("realloc");
+			if (!mp3d.samples) err(1, "realloc");
 		}
 
 		cnt = mp3dec_decode_frame(&mp3d.dec, mp3d.pos, mp3d.left,
@@ -289,7 +283,7 @@ update_sink_input_info(void)
 	op = pa_context_get_sink_input_info(pa_ctx,
 		pa_stream_get_index(pa_strm),
 		update_sink_input_info_callback, NULL);
-	if (!op) ERRX("pa_context_get_sink_input_info failed");
+	if (!op) errx(1, "pa_context_get_sink_input_info failed");
 
 	while (!pa_strm_sink_update) {
 		pa_threaded_mainloop_unlock(pa_mloop);
@@ -559,7 +553,7 @@ input_worker(void *arg)
 
 	if (!cmd_input_mode) {
 		if (tcsetattr(0, TCSANOW, &term_raw))
-			ERR("tcsetattr");
+			err(1, "tcsetattr");
 	}
 
 	printf("+READY\n");
@@ -584,13 +578,13 @@ pulse_context_init(void)
 	int ret;
 
 	pa_mloop_api = pa_threaded_mainloop_get_api(pa_mloop);
-	if (!pa_mloop_api) ERRX("pa_threaded_mainloop_get_api");
+	if (!pa_mloop_api) errx(1, "pa_threaded_mainloop_get_api");
 
 	pa_ctx = pa_context_new(pa_mloop_api, "mplay");
-	if (!pa_ctx) ERRX("pa_context_new");
+	if (!pa_ctx) errx(1, "pa_context_new");
 
 	ret = pa_context_connect(pa_ctx, NULL, 0, NULL);
-	if (ret) ERRX("pa_context_connect: %s",
+	if (ret) errx(1, "pa_context_connect: %s",
 		pa_strerror(pa_context_errno(pa_ctx)));
 
 	while (pa_context_get_state(pa_ctx) != PA_CONTEXT_READY) {
@@ -609,7 +603,7 @@ pulse_stream_init(void)
 	pa_channel_map_init_stereo(&pa_chmap);
 
 	pa_strm = pa_stream_new(pa_ctx, "mplay", &pa_spec, &pa_chmap);
-	if (!pa_strm) ERRX("pa_stream_new: %s",
+	if (!pa_strm) errx(1, "pa_stream_new: %s",
 		pa_strerror(pa_context_errno(pa_ctx)));
 
 	pa_stream_set_write_callback(pa_strm, pa_stream_write_callback, NULL);
@@ -623,7 +617,7 @@ pulse_stream_init(void)
 
 	ret = pa_stream_connect_playback(pa_strm, NULL,
 		&pa_buf, pa_stream_flags, NULL, NULL);
-	if (ret) ERRX("pa_stream_connect_playback failed");
+	if (ret) errx(1, "pa_stream_connect_playback failed");
 
 	while (pa_stream_get_state(pa_strm) != PA_STREAM_READY) {
 		pa_threaded_mainloop_unlock(pa_mloop);
@@ -684,7 +678,7 @@ main(int argc, const char **argv)
 	if (!file) usage();
 
 	if (strlen(file) < 4 || strcmp(file + strlen(file) - 4, ".mp3"))
-		ERRX("Not a mp3 file");
+		errx(1, "not a mp3 file");
 
 	audiofile.data = map_file(file, &audiofile.len);
 	decoder_init();
@@ -693,7 +687,7 @@ main(int argc, const char **argv)
 	pa_spec.rate = mp3d.rate;
 
 	pa_mloop = pa_threaded_mainloop_new();
-	if (!pa_mloop) ERRX("pa_threaded_mainloop_new");
+	if (!pa_mloop) errx(1, "pa_threaded_mainloop_new");
 
 	pa_threaded_mainloop_start(pa_mloop);
 
@@ -708,7 +702,7 @@ main(int argc, const char **argv)
 
 	if (use_stdio) {
 		if (pthread_create(&input_worker_thread, NULL, input_worker, NULL))
-			ERR("pthread_create");
+			err(1, "pthread_create");
 		pthread_join(input_worker_thread, NULL);
 	} else {
 		pthread_mutex_init(&lock, NULL);
